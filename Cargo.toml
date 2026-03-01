@@ -1,0 +1,25 @@
+[package]
+name = "clawmem"
+version = "0.1.0"
+edition = "2024"
+description = "Portable local vector memory DB for OpenClaw agents"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+[dev-dependencies]
+rusqlite = { version = "0.33", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
