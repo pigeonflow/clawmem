@@ -100,6 +100,32 @@ Start with `clawmem serve` and pipe JSON-RPC over stdin/stdout.
 - Replicate across nodes
 - Require a PhD to operate
 
+## Roadmap
+
+**v0.2 — Production hardening**
+- [ ] Int8 quantized vectors (4× memory reduction)
+- [ ] Batch upsert (JSONL ingest)
+- [ ] Tag-based filtering in search (currently type/time only)
+- [ ] Configurable segment capacity per namespace
+- [ ] `clawmem export` / `clawmem import` for backup/migration
+
+**v0.3 — Segment Moment Routing (SMR)**
+- [ ] Circular phase projections per segment (R channels × S harmonics)
+- [ ] Moment-based segment scoring (replaces centroid-only routing)
+- [ ] Matters at 100K+ memories where centroid routing gets noisy
+
+**v0.4 — Theory-backed operations**
+- [ ] SBGP-inspired overlap segments + compaction consistency checks
+- [ ] MAST-inspired `SEMANTICS.md` declaring supported query families
+- [ ] Normalized Moment Score (FMMA-style ratio of Fourier sums)
+
+**v1.0 — Ecosystem**
+- [ ] OpenClaw skill package (install via `clawhub install clawmem`)
+- [ ] Hierarchical segments (segment → block → shard)
+- [ ] Optional local embedding via ONNX runtime
+- [ ] Cross-compile CI (Linux x86/ARM, macOS, Windows)
+- [ ] `crates.io` publish
+
 ## License
 
 MIT
