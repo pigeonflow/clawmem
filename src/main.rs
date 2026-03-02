@@ -9,6 +9,7 @@ mod embed;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::Write;
 use db::Db;
 use types::*;
 
@@ -52,6 +53,17 @@ enum Commands {
         top_segments: usize,
     },
 
+    /// Batch upsert from JSONL (stdin or file)
+    BatchUpsert {
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Path to JSONL file (reads stdin if not provided)
+        #[arg(long)]
+        file: Option<String>,
+    },
+
     /// Delete a memory by ID
     Delete {
         #[arg(long)]
@@ -72,6 +84,26 @@ enum Commands {
     Stats {
         #[arg(long)]
         agent: String,
+    },
+
+    /// Export memories as JSONL
+    Export {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Output file (writes to stdout if not provided)
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Import memories from JSONL (uses batch upsert)
+    Import {
+        #[arg(long)]
+        agent: String,
+        /// Input JSONL file (reads stdin if not provided)
+        #[arg(long)]
+        file: Option<String>,
     },
 
     /// Check database integrity
@@ -137,6 +169,26 @@ fn main() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
+        Commands::BatchUpsert { agent, namespace, file } => {
+            use std::io::BufRead;
+            let reader: Box<dyn std::io::Read> = match file {
+                Some(ref path) => Box::new(std::fs::File::open(path)?),
+                None => Box::new(std::io::stdin()),
+            };
+            let mut items: Vec<search::BatchItem> = Vec::new();
+            for line in std::io::BufReader::new(reader).lines() {
+                let line = line?;
+                if line.trim().is_empty() { continue; }
+                let mut item: search::BatchItem = serde_json::from_str(&line)?;
+                if item.agent_id.is_empty() { item.agent_id = agent.clone(); }
+                if item.namespace == "default" && namespace != "default" {
+                    item.namespace = namespace.clone();
+                }
+                items.push(item);
+            }
+            let results = search::batch_upsert(&db, &items)?;
+            println!("{}", serde_json::json!({"inserted": results.len()}));
+        }
         Commands::Delete { agent, id } => {
             let deleted = db.tombstone_delete(&agent, &id)?;
             println!("{}", serde_json::json!({"deleted": deleted}));
@@ -148,6 +200,44 @@ fn main() -> Result<()> {
         Commands::Stats { agent } => {
             let stats = db.stats(&agent)?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
+        Commands::Export { agent, namespace, output } => {
+            let memories = db.export_memories(&agent, namespace.as_deref())?;
+            let mut writer: Box<dyn std::io::Write> = match output {
+                Some(ref path) => Box::new(std::fs::File::create(path)?),
+                None => Box::new(std::io::stdout()),
+            };
+            for mem in &memories {
+                writeln!(writer, "{}", serde_json::to_string(mem)?)?;
+            }
+            eprintln!("Exported {} memories", memories.len());
+        }
+        Commands::Import { agent, file } => {
+            use std::io::BufRead;
+            let reader: Box<dyn std::io::Read> = match file {
+                Some(ref path) => Box::new(std::fs::File::open(path)?),
+                None => Box::new(std::io::stdin()),
+            };
+            let mut items: Vec<search::BatchItem> = Vec::new();
+            for line in std::io::BufReader::new(reader).lines() {
+                let line = line?;
+                if line.trim().is_empty() { continue; }
+                let v: serde_json::Value = serde_json::from_str(&line)?;
+                let embedding: Vec<f32> = serde_json::from_value(v["embedding"].clone())?;
+                let tags = v.get("tags").and_then(|t| if t.is_null() { None } else { Some(t.to_string()) });
+                items.push(search::BatchItem {
+                    agent_id: v["agent_id"].as_str().unwrap_or(&agent).to_string(),
+                    namespace: v["namespace"].as_str().unwrap_or("default").to_string(),
+                    mem_type: v["type"].as_str().unwrap_or("episodic").to_string(),
+                    content: v["content"].as_str().map(|s| s.to_string()),
+                    embedding,
+                    priority: v["priority"].as_f64().unwrap_or(0.0),
+                    tags,
+                    ttl_seconds: None,
+                });
+            }
+            let results = search::batch_upsert(&db, &items)?;
+            println!("{}", serde_json::json!({"imported": results.len()}));
         }
         Commands::Doctor => {
             let result: String = db.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;

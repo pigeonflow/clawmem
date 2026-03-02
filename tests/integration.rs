@@ -242,7 +242,9 @@ mod tests {
         let (db, path) = test_db("compact");
         let emb = vec![1.0, 0.0, 0.0];
 
-        // insert enough to trigger compaction threshold
+        // Disable auto-compact so we can test manual compact
+        db.set_kv("segment_compact_threshold", "0.99").unwrap();
+
         let mut ids = vec![];
         for i in 0..10 {
             let (id, _) = search::upsert(&db, "a", "ns", "episodic", Some(&format!("mem{i}")), &emb, 0.0, None, None).unwrap();
@@ -254,6 +256,8 @@ mod tests {
             db.tombstone_delete("a", id).unwrap();
         }
 
+        // Now set normal threshold and compact manually
+        db.set_kv("segment_compact_threshold", "0.2").unwrap();
         let (segs, removed) = compact::compact(&db, "a", "ns").unwrap();
         assert_eq!(segs, 1);
         assert_eq!(removed, 3);
@@ -268,9 +272,14 @@ mod tests {
     fn test_compact_empty_segment_removed() {
         let (db, path) = test_db("compact_empty");
         let emb = vec![1.0, 0.0];
+
+        // Disable auto-compact completely
+        db.set_kv("segment_compact_threshold", "2.0").unwrap();
+
         let (id, _) = search::upsert(&db, "a", "ns", "episodic", Some("only"), &emb, 0.0, None, None).unwrap();
         db.tombstone_delete("a", &id).unwrap();
 
+        db.set_kv("segment_compact_threshold", "0.2").unwrap();
         let (segs, removed) = compact::compact(&db, "a", "ns").unwrap();
         assert_eq!(segs, 1);
         assert_eq!(removed, 1);
@@ -382,6 +391,510 @@ mod tests {
         let results = search::search(&db, "a", Some("ns"), &emb, 10, 10, None).unwrap();
         assert!(results.is_empty(), "expired memories should not appear in search");
         cleanup(&path);
+    }
+
+    // ---- Auto-compact and segment merge tests ----
+
+    #[test]
+    fn test_auto_compact_trigger() {
+        let (db, path) = test_db("auto_compact");
+        let emb = vec![1.0, 0.0, 0.0];
+
+        // Insert 5 memories
+        let mut ids = vec![];
+        for i in 0..5 {
+            let (id, _) = search::upsert(&db, "a", "ns", "episodic", Some(&format!("mem{i}")), &emb, 0.0, None, None).unwrap();
+            ids.push(id);
+        }
+
+        // Set low threshold to trigger auto-compact easily
+        db.set_kv("segment_compact_threshold", "0.2").unwrap();
+
+        // Delete 2 out of 5 = 40% > 20% threshold → should auto-compact
+        db.tombstone_delete("a", &ids[0]).unwrap();
+        // First delete: 1/5 = 20%, exactly at threshold → triggers
+        // After compact, tombstones are physically removed
+
+        // Delete another
+        db.tombstone_delete("a", &ids[1]).unwrap();
+
+        // Verify: search should return only 3
+        let results = search::search(&db, "a", Some("ns"), &emb, 10, 10, None).unwrap();
+        assert_eq!(results.len(), 3);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_merge_underfilled_segments() {
+        let (db, path) = test_db("merge_segments");
+
+        // Set small capacity so we create multiple segments
+        db.set_kv("segment_capacity:ns", "3").unwrap();
+        // Disable auto-compact so we control when it happens
+        db.set_kv("segment_compact_threshold", "0.99").unwrap();
+
+        let emb = vec![1.0, 0.0, 0.0];
+        // Insert 9 items → should create 3 segments of 3 each (all closed except last)
+        let mut ids = vec![];
+        for i in 0..9 {
+            let (id, _) = search::upsert(&db, "a", "ns", "episodic", Some(&format!("m{i}")), &emb, 0.0, None, None).unwrap();
+            ids.push(id);
+        }
+
+        let segments_before = db.list_segments("a", Some("ns")).unwrap();
+        assert_eq!(segments_before.len(), 3);
+
+        // Tombstone-delete 2 from first segment and 2 from second
+        // (don't trigger auto-compact because threshold is 99%)
+        db.tombstone_delete("a", &ids[0]).unwrap();
+        db.tombstone_delete("a", &ids[1]).unwrap();
+        db.tombstone_delete("a", &ids[3]).unwrap();
+        db.tombstone_delete("a", &ids[4]).unwrap();
+
+        // Now set a normal threshold and compact
+        db.set_kv("segment_compact_threshold", "0.2").unwrap();
+        compact::compact(&db, "a", "ns").unwrap();
+
+        // After compact + merge: two segments had 1 item each (< 50% of 3)
+        // They should merge together
+        let segments_after = db.list_segments("a", Some("ns")).unwrap();
+        assert!(segments_after.len() < segments_before.len(),
+            "should have fewer segments after merge, got {} (was {})", segments_after.len(), segments_before.len());
+
+        // All 5 remaining memories should still be searchable
+        let results = search::search(&db, "a", Some("ns"), &emb, 10, 10, None).unwrap();
+        assert_eq!(results.len(), 5);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_configurable_segment_capacity() {
+        let (db, path) = test_db("config_capacity");
+
+        // Set capacity to 2 for namespace "small"
+        db.set_kv("segment_capacity:small", "2").unwrap();
+
+        let emb = vec![1.0, 0.0];
+        // Insert 5 items → should create 3 segments (2, 2, 1)
+        for i in 0..5 {
+            search::upsert(&db, "a", "small", "episodic", Some(&format!("s{i}")), &emb, 0.0, None, None).unwrap();
+        }
+
+        let segments = db.list_segments("a", Some("small")).unwrap();
+        assert_eq!(segments.len(), 3, "5 items with capacity 2 should create 3 segments");
+
+        // Default namespace should still use 512
+        assert_eq!(db.get_segment_capacity("default"), 512);
+        assert_eq!(db.get_segment_capacity("small"), 2);
+
+        cleanup(&path);
+    }
+
+    // ---- Export/Import tests ----
+
+    #[test]
+    fn test_export_import_roundtrip() {
+        let (db1, path1) = test_db("export_src");
+        let (db2, path2) = test_db("import_dst");
+
+        // Populate source DB
+        let emb1 = vec![1.0, 0.0, 0.0, 0.0];
+        let emb2 = vec![0.0, 1.0, 0.0, 0.0];
+        search::upsert(&db1, "a", "ns", "episodic", Some("memory one"), &emb1, 0.5,
+            Some(r#"{"project":"test"}"#), None).unwrap();
+        search::upsert(&db1, "a", "ns", "semantic", Some("memory two"), &emb2, 1.0,
+            None, None).unwrap();
+
+        // Export
+        let exported = db1.export_memories("a", Some("ns")).unwrap();
+        assert_eq!(exported.len(), 2);
+
+        // Write to JSONL string, then parse as BatchItems and import
+        let mut items: Vec<search::BatchItem> = Vec::new();
+        for mem in &exported {
+            let embedding: Vec<f32> = serde_json::from_value(mem["embedding"].clone()).unwrap();
+            let tags = mem.get("tags").and_then(|t| if t.is_null() { None } else { Some(t.to_string()) });
+            items.push(search::BatchItem {
+                agent_id: "b".to_string(), // different agent
+                namespace: mem["namespace"].as_str().unwrap().to_string(),
+                mem_type: mem["type"].as_str().unwrap().to_string(),
+                content: mem["content"].as_str().map(|s| s.to_string()),
+                embedding,
+                priority: mem["priority"].as_f64().unwrap_or(0.0),
+                tags,
+                ttl_seconds: None,
+            });
+        }
+        search::batch_upsert(&db2, &items).unwrap();
+
+        // Verify import
+        let stats = db2.stats("b").unwrap();
+        assert_eq!(stats["total"], 2);
+
+        // Search should yield same results
+        let results = search::search(&db2, "b", Some("ns"), &emb1, 2, 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content.as_deref(), Some("memory one"));
+
+        // Tag preserved
+        let filters = SearchFilters {
+            mem_types: None,
+            tags: Some(serde_json::json!({"project": "test"})),
+            after_ms: None, before_ms: None,
+        };
+        let tagged = search::search(&db2, "b", Some("ns"), &emb1, 10, 10, Some(&filters)).unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].content.as_deref(), Some("memory one"));
+
+        cleanup(&path1);
+        cleanup(&path2);
+    }
+
+    // ---- Batch upsert tests ----
+
+    #[test]
+    fn test_batch_upsert() {
+        let (db, path) = test_db("batch_upsert");
+        let dim = 8;
+        let mut items: Vec<search::BatchItem> = Vec::new();
+        for i in 0..100 {
+            let mut emb = rand_embedding(dim, i as u64);
+            normalize(&mut emb);
+            items.push(search::BatchItem {
+                agent_id: "a".to_string(),
+                namespace: "ns".to_string(),
+                mem_type: "episodic".to_string(),
+                content: Some(format!("batch-mem-{i}")),
+                embedding: emb,
+                priority: 0.0,
+                tags: None,
+                ttl_seconds: None,
+            });
+        }
+
+        let results = search::batch_upsert(&db, &items).unwrap();
+        assert_eq!(results.len(), 100);
+
+        // All IDs should be unique
+        let ids: std::collections::HashSet<_> = results.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(ids.len(), 100);
+
+        // Stats should show 100 memories
+        let stats = db.stats("a").unwrap();
+        assert_eq!(stats["total"], 100);
+
+        // Search should work
+        let query = &items[42].embedding;
+        let search_results = search::search(&db, "a", Some("ns"), query, 5, 10, None).unwrap();
+        assert_eq!(search_results.len(), 5);
+        // Top result should be the exact match
+        assert_eq!(search_results[0].content.as_deref(), Some("batch-mem-42"));
+
+        // Verify centroids exist for all segments
+        let segments = db.list_segments("a", Some("ns")).unwrap();
+        for seg in &segments {
+            assert!(seg.centroid.is_some(), "segment {} should have centroid", seg.id);
+        }
+
+        cleanup(&path);
+    }
+
+    // ---- Tag filtering tests ----
+
+    #[test]
+    fn test_search_tag_filter() {
+        let (db, path) = test_db("tag_filter");
+        let emb = vec![1.0, 0.0, 0.0, 0.0];
+
+        // Insert with different tags
+        search::upsert(&db, "a", "ns", "episodic", Some("tagged-project"),
+            &emb, 0.0, Some(r#"{"project":"brain-arch","env":"prod"}"#), None).unwrap();
+        search::upsert(&db, "a", "ns", "episodic", Some("tagged-other"),
+            &emb, 0.0, Some(r#"{"project":"clawmem","env":"dev"}"#), None).unwrap();
+        search::upsert(&db, "a", "ns", "episodic", Some("no-tags"),
+            &emb, 0.0, None, None).unwrap();
+
+        // Filter by project=brain-arch
+        let filters = SearchFilters {
+            mem_types: None,
+            tags: Some(serde_json::json!({"project": "brain-arch"})),
+            after_ms: None, before_ms: None,
+        };
+        let results = search::search(&db, "a", Some("ns"), &emb, 10, 10, Some(&filters)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content.as_deref(), Some("tagged-project"));
+
+        // Filter by env=dev
+        let filters2 = SearchFilters {
+            mem_types: None,
+            tags: Some(serde_json::json!({"env": "dev"})),
+            after_ms: None, before_ms: None,
+        };
+        let results2 = search::search(&db, "a", Some("ns"), &emb, 10, 10, Some(&filters2)).unwrap();
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].content.as_deref(), Some("tagged-other"));
+
+        // Filter by both (AND): project=brain-arch AND env=prod
+        let filters3 = SearchFilters {
+            mem_types: None,
+            tags: Some(serde_json::json!({"project": "brain-arch", "env": "prod"})),
+            after_ms: None, before_ms: None,
+        };
+        let results3 = search::search(&db, "a", Some("ns"), &emb, 10, 10, Some(&filters3)).unwrap();
+        assert_eq!(results3.len(), 1);
+        assert_eq!(results3[0].content.as_deref(), Some("tagged-project"));
+
+        // Filter by non-matching combo: project=brain-arch AND env=dev → 0 results
+        let filters4 = SearchFilters {
+            mem_types: None,
+            tags: Some(serde_json::json!({"project": "brain-arch", "env": "dev"})),
+            after_ms: None, before_ms: None,
+        };
+        let results4 = search::search(&db, "a", Some("ns"), &emb, 10, 10, Some(&filters4)).unwrap();
+        assert_eq!(results4.len(), 0);
+
+        // No tag filter → all 3 returned
+        let results_all = search::search(&db, "a", Some("ns"), &emb, 10, 10, None).unwrap();
+        assert_eq!(results_all.len(), 3);
+
+        cleanup(&path);
+    }
+
+    // ---- Concurrent stress tests ----
+
+    #[test]
+    fn test_concurrent_stress() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let db_path = format!("/tmp/clawmem_stress_{}.db", std::process::id());
+        // Initialize DB
+        {
+            let db = Db::open(&db_path).unwrap();
+            // Disable auto-compact to avoid contention
+            db.set_kv("segment_compact_threshold", "2.0").unwrap();
+        }
+
+        let n_writers = 4;
+        let writes_per = 100;
+        let n_readers = 4;
+        let reads_per = 50;
+        let dim = 8;
+        let path = Arc::new(db_path.clone());
+        let barrier = Arc::new(Barrier::new(n_writers + n_readers));
+
+        let mut handles = vec![];
+
+        // Writer threads
+        for w in 0..n_writers {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let db = Db::open(&path).unwrap();
+                barrier.wait();
+                for i in 0..writes_per {
+                    let mut emb = vec![0.0f32; dim];
+                    emb[w % dim] = 1.0;
+                    emb[(w + i) % dim] += 0.1 * i as f32;
+                    let content = format!("w{w}-m{i}");
+                    // Retry on busy
+                    for attempt in 0..5 {
+                        match search::upsert(&db, "stress", "ns", "episodic",
+                                            Some(&content), &emb, 0.0, None, None) {
+                            Ok(_) => break,
+                            Err(e) if attempt < 4 => {
+                                thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1) as u64));
+                                if attempt == 4 { panic!("writer {w} failed after retries: {e}"); }
+                            }
+                            Err(e) => panic!("writer {w} item {i}: {e}"),
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Reader threads
+        for r in 0..n_readers {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let db = Db::open(&path).unwrap();
+                barrier.wait();
+                let mut emb = vec![0.0f32; dim];
+                emb[r % dim] = 1.0;
+                for _ in 0..reads_per {
+                    // Search should not panic or return corrupted data
+                    let results = search::search(&db, "stress", Some("ns"), &emb, 10, 10, None).unwrap();
+                    for result in &results {
+                        assert!(result.score >= 0.0, "negative score!");
+                        assert!(result.content.is_some(), "null content!");
+                    }
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Verify all 400 memories present
+        let db = Db::open(&db_path).unwrap();
+        let stats = db.stats("stress").unwrap();
+        assert_eq!(stats["total"], n_writers as i64 * writes_per as i64,
+            "expected {} memories, got {}", n_writers * writes_per, stats["total"]);
+
+        // Search should still work correctly
+        let emb = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let results = search::search(&db, "stress", Some("ns"), &emb, 10, 20, None).unwrap();
+        assert_eq!(results.len(), 10);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ---- MCP Protocol Tests ----
+
+    fn mcp_roundtrip(db_path: &str, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+
+        let binary = env!("CARGO_BIN_EXE_clawmem");
+        let mut child = Command::new(binary)
+            .args(&["--db", db_path, "serve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn clawmem serve");
+
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        // Write all requests
+        for req in requests {
+            writeln!(stdin, "{}", serde_json::to_string(req).unwrap()).unwrap();
+        }
+        drop(stdin); // close stdin to signal EOF
+
+        // Read all responses
+        let reader = std::io::BufReader::new(stdout);
+        let responses: Vec<serde_json::Value> = reader.lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect();
+
+        child.wait().unwrap();
+        responses
+    }
+
+    #[test]
+    fn test_mcp_protocol_initialize() {
+        let db_path = format!("/tmp/clawmem_mcp_init_{}.db", std::process::id());
+        let responses = mcp_roundtrip(&db_path, &[
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        ]);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 1);
+        assert!(responses[0]["result"]["serverInfo"]["name"].as_str().unwrap().contains("clawmem"));
+        assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_mcp_protocol_tools_list() {
+        let db_path = format!("/tmp/clawmem_mcp_tools_{}.db", std::process::id());
+        let responses = mcp_roundtrip(&db_path, &[
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        ]);
+        assert_eq!(responses.len(), 1);
+        let tools = responses[0]["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"memory.upsert"));
+        assert!(names.contains(&"memory.search"));
+        assert!(names.contains(&"memory.delete"));
+        assert!(names.contains(&"memory.compact"));
+        assert!(names.contains(&"memory.stats"));
+        assert!(names.contains(&"memory.batch_upsert"));
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_mcp_protocol_full_roundtrip() {
+        let db_path = format!("/tmp/clawmem_mcp_full_{}.db", std::process::id());
+        let emb = vec![1.0, 0.0, 0.0, 0.0];
+        let responses = mcp_roundtrip(&db_path, &[
+            // Initialize
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            // Upsert
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "memory.upsert",
+                "arguments": {"agent_id": "test", "embedding": emb, "content": "hello world", "type": "episodic"}
+            }}),
+            // Search
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "memory.search",
+                "arguments": {"agent_id": "test", "query_embedding": emb, "k": 5}
+            }}),
+            // Stats
+            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "memory.stats",
+                "arguments": {"agent_id": "test"}
+            }}),
+            // Delete (we'll get the ID from upsert result)
+            serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                "name": "memory.delete",
+                "arguments": {"agent_id": "test", "id": "nonexistent"}
+            }}),
+            // Compact
+            serde_json::json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+                "name": "memory.compact",
+                "arguments": {"agent_id": "test", "namespace": "default"}
+            }}),
+        ]);
+
+        assert_eq!(responses.len(), 6);
+
+        // All should have valid jsonrpc and matching ids
+        for (i, resp) in responses.iter().enumerate() {
+            assert_eq!(resp["jsonrpc"], "2.0");
+            assert_eq!(resp["id"], (i + 1) as i64);
+            assert!(resp.get("error").is_none(), "unexpected error on request {}: {:?}", i+1, resp["error"]);
+        }
+
+        // Upsert result should have an id
+        let upsert_text: serde_json::Value = serde_json::from_str(
+            responses[1]["result"]["content"][0]["text"].as_str().unwrap()
+        ).unwrap();
+        assert!(upsert_text["id"].is_string());
+
+        // Search should return 1 result
+        let search_text: serde_json::Value = serde_json::from_str(
+            responses[2]["result"]["content"][0]["text"].as_str().unwrap()
+        ).unwrap();
+        assert_eq!(search_text["results"].as_array().unwrap().len(), 1);
+
+        // Stats should show total=1
+        let stats_text: serde_json::Value = serde_json::from_str(
+            responses[3]["result"]["content"][0]["text"].as_str().unwrap()
+        ).unwrap();
+        assert_eq!(stats_text["total"], 1);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_mcp_protocol_error_handling() {
+        let db_path = format!("/tmp/clawmem_mcp_err_{}.db", std::process::id());
+        let responses = mcp_roundtrip(&db_path, &[
+            // Malformed JSON (not valid, but we send as string)
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "nonexistent_method", "params": {}}),
+        ]);
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].get("error").is_some());
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // ---- MCP protocol test ----

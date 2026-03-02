@@ -64,6 +64,22 @@ pub fn search(db: &Db, agent_id: &str, namespace: Option<&str>,
                 if let Some(before) = f.before_ms {
                     if created_at > before { continue; }
                 }
+                // Tag filtering: match all specified key-value pairs
+                if let Some(ref filter_tags) = f.tags {
+                    if let Some(filter_obj) = filter_tags.as_object() {
+                        if !filter_obj.is_empty() {
+                            let mem_tags: Option<serde_json::Value> = tags_str.as_ref()
+                                .and_then(|s| serde_json::from_str(s).ok());
+                            match mem_tags.as_ref().and_then(|v| v.as_object()) {
+                                Some(mt) => {
+                                    let all_match = filter_obj.iter().all(|(k, v)| mt.get(k) == Some(v));
+                                    if !all_match { continue; }
+                                }
+                                None => continue, // no tags on memory, filter requires some
+                            }
+                        }
+                    }
+                }
             }
 
             let sim = cosine_sim(query_embedding, &emb);
@@ -89,6 +105,49 @@ pub fn search(db: &Db, agent_id: &str, namespace: Option<&str>,
     results.truncate(k);
     Ok(results)
 }
+
+/// Batch upsert multiple memories in a single transaction.
+/// Returns vec of (id, segment_id) pairs.
+pub fn batch_upsert(db: &Db, items: &[BatchItem]) -> Result<Vec<(String, i64)>> {
+    let tx_result: Result<Vec<(String, i64)>> = (|| {
+        // We can't use a real SQLite transaction through Db easily,
+        // so we use SAVEPOINT via raw conn
+        db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            match upsert(db, &item.agent_id, &item.namespace, &item.mem_type,
+                         item.content.as_deref(), &item.embedding, item.priority,
+                         item.tags.as_deref(), item.ttl_seconds) {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    db.conn.execute_batch("ROLLBACK")?;
+                    return Err(e);
+                }
+            }
+        }
+        db.conn.execute_batch("COMMIT")?;
+        Ok(results)
+    })();
+    tx_result
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BatchItem {
+    pub agent_id: String,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    #[serde(rename = "type", default = "default_type")]
+    pub mem_type: String,
+    pub content: Option<String>,
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub priority: f64,
+    pub tags: Option<String>,
+    pub ttl_seconds: Option<i64>,
+}
+
+fn default_namespace() -> String { "default".to_string() }
+fn default_type() -> String { "episodic".to_string() }
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() { return 0.0; }

@@ -93,6 +93,13 @@ fn handle_method(db: &Db, method: &str, params: &Value) -> Result<Value> {
                     },
                     "required": ["agent_id"]
                 })),
+                tool_def("memory.batch_upsert", "Batch insert memories from array", json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {"type": "array", "items": {"type": "object"}}
+                    },
+                    "required": ["items"]
+                })),
                 tool_def("memory.stats", "Get memory statistics", json!({
                     "type": "object",
                     "properties": { "agent_id": {"type": "string"} },
@@ -153,6 +160,11 @@ fn handle_tool(db: &Db, name: &str, args: &Value) -> Result<Value> {
             let namespace = args["namespace"].as_str().unwrap_or("default");
             let (segs, removed) = crate::compact::compact(db, agent_id, namespace)?;
             Ok(json!({"segments_compacted": segs, "records_removed": removed}))
+        }
+        "memory.batch_upsert" => {
+            let items: Vec<crate::search::BatchItem> = serde_json::from_value(args["items"].clone())?;
+            let results = crate::search::batch_upsert(db, &items)?;
+            Ok(json!({"inserted": results.len(), "ids": results.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()}))
         }
         "memory.stats" => {
             let agent_id = args["agent_id"].as_str().ok_or_else(|| anyhow::anyhow!("missing agent_id"))?;
